@@ -2,39 +2,44 @@ import dotenv from "dotenv";
 import { z } from "zod";
 import { Client } from "@elastic/elasticsearch";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import express from "express";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import OpenAI from "openai";
 
 dotenv.config();
 
 const ELASTICSEARCH_ENDPOINT =
   process.env.ELASTICSEARCH_ENDPOINT ?? "http://localhost:9200";
 const ELASTICSEARCH_API_KEY = process.env.ELASTICSEARCH_API_KEY ?? "";
-const INDEX = "invoices";
+const INDEX = "documents";
 
-// Schemas for invoice validation
-const ServiceSchema = z.object({
-  name: z.string().min(1),
-  price: z.number().nonnegative(),
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
 });
 
-const InvoiceSchema = z.object({
-  id: z.string().min(1),
-  issue_date: z.string().refine((s) => !Number.isNaN(Date.parse(s)), {
-    message: "issue_date must be a valid date string",
-  }),
-  total_amount: z.number().nonnegative(),
-  description: z.string().optional(),
-  file_url: z.string().url().optional(),
-  services: z.array(ServiceSchema).optional(),
+const DocumentSchema = z.object({
+  id: z.number(),
+  title: z.string(),
+  content: z.string(),
+  tags: z.array(z.string()),
 });
 
-type Invoice = z.infer<typeof InvoiceSchema>;
+const SearchResultSchema = z.object({
+  id: z.number(),
+  title: z.string(),
+  content: z.string(),
+  tags: z.array(z.string()),
+  score: z.number(),
+});
+
+type Document = z.infer<typeof DocumentSchema>;
+type SearchResult = z.infer<typeof SearchResultSchema>;
+
+const searchContextStore = new Map<string, SearchResult[]>();
 
 const server = new McpServer({
-  name: "Elasticsearch MCP",
+  name: "Elasticsearch RAG MCP",
   description:
-    "A server that retrieves data related with invoices from Elasticsearch",
+    "A Retrieval-Augmented Generation (RAG) server using Elasticsearch. Provides tools for document search, result summarization, and source citation.",
   version: "1.0.0",
 });
 
@@ -46,167 +51,292 @@ const _client = new Client({
 });
 
 server.registerTool(
-  "get-search-by-date-results",
+  "search_docs",
   {
-    title: "Get Search By Date Results",
+    title: "Search Documents",
     description:
-      "Get the results of a search by date query based on a from and to date. This query will return results based on the issue_date field in the Elasticsearch index. This tool must be used when the user is asking for information about a specific date range. All the results will be related with invoices.",
+      "Search for relevant documents in Elasticsearch using full-text search. Returns the most relevant documents with their content, title, tags, and relevance score. Use this tool first to retrieve context before answering questions.",
     inputSchema: {
-      from: z.string().describe("The start date of the search"),
-      to: z.string().describe("The end date of the search"),
+      query: z.string().describe("The search query to find relevant documents"),
+      max_results: z
+        .number()
+        .optional()
+        .default(5)
+        .describe("Maximum number of results to return (default: 5)"),
+      session_id: z
+        .string()
+        .optional()
+        .describe(
+          "Session ID to store search context for later summarization and citation"
+        ),
     },
     outputSchema: {
-      result: z.array(InvoiceSchema),
+      results: z.array(SearchResultSchema),
+      total: z.number(),
+      session_id: z.string().optional(),
     },
   },
-  async ({ from, to }) => {
-    if (!from || !to) {
+  async ({ query, max_results = 5, session_id }) => {
+    if (!query) {
       return {
         content: [
           {
             type: "text",
-            text: "Both fromDate and toDate parameters are required",
+            text: "Query parameter is required",
           },
         ],
         isError: true,
       };
     }
 
-    const formattedFrom = formatDate(new Date(from));
-    const formattedTo = formatDate(new Date(to));
-
-    function formatDate(date: Date) {
-      const day = String(date.getDate()).padStart(2, "0");
-      const month = String(date.getMonth() + 1).padStart(2, "0");
-      const year = date.getFullYear();
-      return `${day}/${month}/${year}`;
-    }
-
-    const response = await _client.search({
-      index: INDEX,
-      query: {
-        range: {
-          issue_date: {
-            gte: formattedFrom,
-            lte: formattedTo,
-            format: "dd/MM/yyyy",
+    try {
+      const response = await _client.search({
+        index: INDEX,
+        size: max_results,
+        query: {
+          multi_match: {
+            query: query,
+            fields: ["title^2", "content", "tags^1.5"],
+            type: "best_fields",
+            fuzziness: "AUTO",
           },
         },
-      },
-    });
+      });
 
-    const populatedResults = response.hits.hits.map((hit) => {
-      return JSON.stringify(hit._source);
-    });
+      const results: SearchResult[] = response.hits.hits.map((hit: any) => {
+        const source = hit._source as Document;
+        return {
+          id: source.id,
+          title: source.title,
+          content: source.content,
+          tags: source.tags,
+          score: hit._score ?? 0,
+        };
+      });
 
-    const rawResults = response.hits.hits.map((hit) => hit._source ?? null);
-    const results: Invoice[] = [];
+      // Store context for later use
+      const contextId = session_id || `session_${Date.now()}`;
+      searchContextStore.set(contextId, results);
 
-    rawResults.forEach((r, i) => {
-      const parsed = InvoiceSchema.safeParse(r);
-      if (parsed.success) results.push(parsed.data);
-    });
+      const contentText = results
+        .map(
+          (r, i) =>
+            `[${i + 1}] ${r.title} (score: ${r.score.toFixed(
+              2
+            )})\n${r.content.substring(0, 200)}...`
+        )
+        .join("\n\n");
 
-    return {
-      content: [
-        {
-          type: "text",
-          text: populatedResults.join("\n"),
+      const totalHits =
+        typeof response.hits.total === "number"
+          ? response.hits.total
+          : response.hits.total?.value ?? 0;
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Found ${results.length} relevant documents:\n\n${contentText}`,
+          },
+        ],
+        structuredContent: {
+          results: results,
+          total: totalHits,
+          session_id: contextId,
         },
-      ],
-      structuredContent: {
-        result: results,
-      },
-    };
+      };
+    } catch (error: any) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error searching documents: ${error.message}`,
+          },
+        ],
+        isError: true,
+      };
+    }
   }
 );
 
 server.registerTool(
-  "get-semantic-search-results",
+  "summarize_results",
   {
-    title: "Get Semantic Search Results",
+    title: "Summarize Search Results",
     description:
-      "Get the results of a semantic search query based on a query string. This query will return results based on the semantic field in the Elasticsearch index. This tool must be used when the user is asking for information about a specific topic or concept. All the results will be related with invoices.",
+      "Summarize and synthesize information from previously retrieved documents to answer a user question. Requires a session_id from a previous search_docs call. Generates a coherent answer based on the retrieved content.",
     inputSchema: {
-      q: z.string().describe("The query string to search for"),
+      session_id: z.string().describe("Session ID from the search_docs call"),
+      question: z.string().describe("The question to answer"),
+      max_length: z
+        .number()
+        .optional()
+        .default(500)
+        .describe("Maximum length of the summary in characters"),
     },
     outputSchema: {
-      result: z.array(InvoiceSchema),
+      summary: z.string(),
+      sources_used: z.number(),
     },
   },
-  async ({ q }) => {
-    if (!q) {
+  async ({ session_id, question, max_length = 500 }) => {
+    if (!session_id || !question) {
       return {
         content: [
           {
             type: "text",
-            text: "The query parameter is required",
+            text: "Both session_id and question parameters are required",
           },
         ],
         isError: true,
       };
     }
 
-    const response = await _client.search({
-      index: INDEX,
-      query: {
-        semantic: {
-          field: "semantic_field",
-          query: q,
+    const searchResults = searchContextStore.get(session_id);
+
+    if (!searchResults || searchResults.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "No search results found for this session. Please call search_docs first.",
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    try {
+      // Prepare context from retrieved documents
+      const context = searchResults
+        .slice(0, 5)
+        .map((r, i) => `[Document ${i + 1}: ${r.title}]\n${r.content}`)
+        .join("\n\n---\n\n");
+
+      // Call OpenAI to generate summary
+      const completion = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are a helpful assistant that answers questions based on provided documents. Synthesize information from the documents to answer the user's question accurately and concisely. If the documents don't contain relevant information, say so.",
+          },
+          {
+            role: "user",
+            content: `Question: ${question}\n\nRelevant Documents:\n${context}`,
+          },
+        ],
+        max_tokens: Math.min(Math.ceil(max_length / 4), 1000),
+        temperature: 0.3,
+      });
+
+      const summary =
+        completion.choices[0]?.message?.content || "No summary generated.";
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: summary,
+          },
+        ],
+        structuredContent: {
+          summary: summary,
+          sources_used: searchResults.length,
         },
-      },
-    });
+      };
+    } catch (error: any) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error generating summary: ${error.message}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+);
 
-    const populatedResults = response.hits.hits.map((hit) => {
-      return JSON.stringify(hit._source);
-    });
+// Tool 3: Cite sources
+server.registerTool(
+  "cite_sources",
+  {
+    title: "Cite Sources",
+    description:
+      "Return citation information for documents used in the previous search. Provides document IDs, titles, and tags for proper attribution. Use this after summarize_results to provide references.",
+    inputSchema: {
+      session_id: z.string().describe("Session ID from the search_docs call"),
+    },
+    outputSchema: {
+      citations: z.array(
+        z.object({
+          id: z.number(),
+          title: z.string(),
+          tags: z.array(z.string()),
+          relevance_score: z.number(),
+        })
+      ),
+    },
+  },
+  async ({ session_id }) => {
+    if (!session_id) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "session_id parameter is required",
+          },
+        ],
+        isError: true,
+      };
+    }
 
-    const rawResults = response.hits.hits.map((hit) => hit._source ?? null);
-    const results: Invoice[] = [];
+    const searchResults = searchContextStore.get(session_id);
 
-    rawResults.forEach((r, i) => {
-      const parsed = InvoiceSchema.safeParse(r);
-      if (parsed.success) results.push(parsed.data);
-    });
+    if (!searchResults || searchResults.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "No search results found for this session. Please call search_docs first.",
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    const citations = searchResults.map((r) => ({
+      id: r.id,
+      title: r.title,
+      tags: r.tags,
+      relevance_score: r.score,
+    }));
+
+    const citationText = citations
+      .map(
+        (c, i) =>
+          `[${i + 1}] ID: ${c.id}, Title: "${c.title}", Tags: ${c.tags.join(
+            ", "
+          )}, Score: ${c.relevance_score.toFixed(2)}`
+      )
+      .join("\n");
 
     return {
       content: [
         {
           type: "text",
-          text: populatedResults.join("\n"),
+          text: `Sources used (${citations.length}):\n\n${citationText}`,
         },
       ],
       structuredContent: {
-        result: results,
+        citations: citations,
       },
     };
   }
 );
 
-const app = express();
-app.use(express.json());
-
-app.post("/mcp", async (req, res) => {
-  // Create a new transport for each request to prevent request ID collisions
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: undefined,
-    enableJsonResponse: true,
-  });
-
-  res.on("close", () => {
-    transport.close();
-  });
-
-  await server.connect(transport);
-  await transport.handleRequest(req, res, req.body);
-});
-
-const port = parseInt(process.env.PORT || "3000");
-app
-  .listen(port, () => {
-    console.log(`Demo MCP Server running on http://localhost:${port}/mcp`);
-  })
-  .on("error", (error) => {
-    console.error("Server error:", error);
-    process.exit(1);
-  });
+const transport = new StdioServerTransport();
+await server.connect(transport);

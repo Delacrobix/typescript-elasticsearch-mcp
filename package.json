@@ -1,21 +1,27 @@
 {
-  "name": "app",
+  "name": "elasticsearch-rag-mcp",
   "version": "1.0.0",
   "type": "module",
-  "main": "index.ts",
+  "main": "dist/index.js",
   "scripts": {
-    "start": "node --loader ts-node/esm index.ts"
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "node --loader ts-node/esm index.ts",
+    "setup": "node --loader ts-node/esm setup.ts",
+    "setup:force": "node --loader ts-node/esm setup.ts --force"
   },
-  "license": "ISC",
-  "description": "",
   "dependencies": {
     "@elastic/elasticsearch": "^9.1.1",
     "@modelcontextprotocol/sdk": "^1.20.0",
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
-    "ts-node": "^10.9.2"
+    "openai": "^6.3.0",
+    "ts-node": "^10.9.2",
+    "zod": "^3.23.8"
   },
   "devDependencies": {
-    "@types/express": "^5.0.3"
+    "@types/express": "^5.0.3",
+    "@types/node": "^20.11.0",
+    "typescript": "^5.3.3"
   }
 }
