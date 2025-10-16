@@ -34,10 +34,6 @@ const SearchResultSchema = z.object({
   content: z.string(),
   tags: z.array(z.string()),
   score: z.number(),
-  highlight: z.object({
-    title: z.array(z.string()),
-    content: z.array(z.string()),
-  }),
 });
 
 type Document = z.infer<typeof DocumentSchema>;
@@ -128,8 +124,10 @@ server.registerTool(
         const source = hit._source as Document;
 
         return {
-          ...source,
-          highlight: hit.highlight,
+          id: source.id,
+          title: source.title,
+          content: source.content,
+          tags: source.tags,
           score: hit._score ?? 0,
         };
       });
