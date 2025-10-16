@@ -1,15 +1,18 @@
-import dotenv from "dotenv";
+import { config } from "dotenv";
 import { Client } from "@elastic/elasticsearch";
 import { readFileSync } from "fs";
 
-dotenv.config();
+config();
 
 const INDEX_NAME = "documents";
+const ELASTICSEARCH_ENDPOINT =
+  process.env.ELASTICSEARCH_ENDPOINT ?? "http://localhost:9200";
+const ELASTICSEARCH_API_KEY = process.env.ELASTICSEARCH_API_KEY ?? "";
 
 const client = new Client({
-  node: process.env.ELASTICSEARCH_ENDPOINT ?? "http://localhost:9200",
+  node: ELASTICSEARCH_ENDPOINT,
   auth: {
-    apiKey: process.env.ELASTICSEARCH_API_KEY ?? "",
+    apiKey: ELASTICSEARCH_API_KEY,
   },
 });
 

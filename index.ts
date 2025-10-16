@@ -1,19 +1,24 @@
-import dotenv from "dotenv";
 import { z } from "zod";
 import { Client } from "@elastic/elasticsearch";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import OpenAI from "openai";
 
-dotenv.config();
-
 const ELASTICSEARCH_ENDPOINT =
   process.env.ELASTICSEARCH_ENDPOINT ?? "http://localhost:9200";
 const ELASTICSEARCH_API_KEY = process.env.ELASTICSEARCH_API_KEY ?? "";
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY ?? "";
 const INDEX = "documents";
 
 const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
+  apiKey: OPENAI_API_KEY,
+});
+
+const _client = new Client({
+  node: ELASTICSEARCH_ENDPOINT,
+  auth: {
+    apiKey: ELASTICSEARCH_API_KEY,
+  },
 });
 
 const DocumentSchema = z.object({
@@ -29,6 +34,10 @@ const SearchResultSchema = z.object({
   content: z.string(),
   tags: z.array(z.string()),
   score: z.number(),
+  highlight: z.object({
+    title: z.array(z.string()),
+    content: z.array(z.string()),
+  }),
 });
 
 type Document = z.infer<typeof DocumentSchema>;
@@ -39,15 +48,8 @@ const searchContextStore = new Map<string, SearchResult[]>();
 const server = new McpServer({
   name: "Elasticsearch RAG MCP",
   description:
-    "A Retrieval-Augmented Generation (RAG) server using Elasticsearch. Provides tools for document search, result summarization, and source citation.",
+    "A RAG server using Elasticsearch. Provides tools for document search, result summarization, and source citation.",
   version: "1.0.0",
-});
-
-const _client = new Client({
-  node: ELASTICSEARCH_ENDPOINT,
-  auth: {
-    apiKey: ELASTICSEARCH_API_KEY,
-  },
 });
 
 server.registerTool(
@@ -55,14 +57,12 @@ server.registerTool(
   {
     title: "Search Documents",
     description:
-      "Search for relevant documents in Elasticsearch using full-text search. Returns the most relevant documents with their content, title, tags, and relevance score. Use this tool first to retrieve context before answering questions.",
+      "Search for documents in Elasticsearch using full-text search. Returns the most relevant documents with their content, title, tags, and relevance score. Use this tool first to retrieve context before answering questions.",
     inputSchema: {
-      query: z.string().describe("The search query to find relevant documents"),
-      max_results: z
-        .number()
-        .optional()
-        .default(5)
-        .describe("Maximum number of results to return (default: 5)"),
+      query: z
+        .string()
+        .describe("The search query terms to find relevant documents"),
+      max_results: z.number().describe("Maximum number of results to return"),
       session_id: z
         .string()
         .optional()
@@ -94,22 +94,42 @@ server.registerTool(
         index: INDEX,
         size: max_results,
         query: {
-          multi_match: {
-            query: query,
-            fields: ["title^2", "content", "tags^1.5"],
-            type: "best_fields",
-            fuzziness: "AUTO",
+          bool: {
+            must: [
+              {
+                multi_match: {
+                  query: query,
+                  fields: ["title^2", "content", "tags"],
+                  fuzziness: "AUTO",
+                },
+              },
+            ],
+            should: [
+              {
+                match_phrase: {
+                  title: {
+                    query: query,
+                    boost: 2,
+                  },
+                },
+              },
+            ],
+          },
+        },
+        highlight: {
+          fields: {
+            title: {},
+            content: {},
           },
         },
       });
 
       const results: SearchResult[] = response.hits.hits.map((hit: any) => {
         const source = hit._source as Document;
+
         return {
-          id: source.id,
-          title: source.title,
-          content: source.content,
-          tags: source.tags,
+          ...source,
+          highlight: hit.highlight,
           score: hit._score ?? 0,
         };
       });
@@ -170,8 +190,6 @@ server.registerTool(
       question: z.string().describe("The question to answer"),
       max_length: z
         .number()
-        .optional()
-        .default(500)
         .describe("Maximum length of the summary in characters"),
     },
     outputSchema: {
@@ -207,13 +225,12 @@ server.registerTool(
     }
 
     try {
-      // Prepare context from retrieved documents
       const context = searchResults
         .slice(0, 5)
         .map((r, i) => `[Document ${i + 1}: ${r.title}]\n${r.content}`)
         .join("\n\n---\n\n");
 
-      // Call OpenAI to generate summary
+      // Generate summary with OpenAI
       const completion = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         messages: [
@@ -232,7 +249,8 @@ server.registerTool(
       });
 
       const summary =
-        completion.choices[0]?.message?.content || "No summary generated.";
+        "AI generated summary: " + completion.choices[0]?.message?.content ||
+        "No summary generated.";
 
       return {
         content: [
@@ -339,4 +357,4 @@ server.registerTool(
 );
 
 const transport = new StdioServerTransport();
-await server.connect(transport);
+server.connect(transport);
