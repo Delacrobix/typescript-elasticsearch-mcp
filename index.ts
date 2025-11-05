@@ -39,8 +39,6 @@ const SearchResultSchema = z.object({
 type Document = z.infer<typeof DocumentSchema>;
 type SearchResult = z.infer<typeof SearchResultSchema>;
 
-const searchContextStore = new Map<string, SearchResult[]>();
-
 const server = new McpServer({
   name: "Elasticsearch RAG MCP",
   description:
@@ -53,26 +51,19 @@ server.registerTool(
   {
     title: "Search Documents",
     description:
-      "Search for documents in Elasticsearch using full-text search. Returns the most relevant documents with their content, title, tags, and relevance score. Use this tool first to retrieve context before answering questions.",
+      "Search for documents in Elasticsearch using full-text search. Returns the most relevant documents with their content, title, tags, and relevance score.",
     inputSchema: {
       query: z
         .string()
         .describe("The search query terms to find relevant documents"),
       max_results: z.number().describe("Maximum number of results to return"),
-      session_id: z
-        .string()
-        .optional()
-        .describe(
-          "Session ID to store search context for later summarization and citation"
-        ),
     },
     outputSchema: {
       results: z.array(SearchResultSchema),
       total: z.number(),
-      session_id: z.string().optional(),
     },
   },
-  async ({ query, max_results = 5, session_id }) => {
+  async ({ query, max_results = 5 }) => {
     if (!query) {
       return {
         content: [
@@ -132,10 +123,6 @@ server.registerTool(
         };
       });
 
-      // Store context for later use
-      const contextId = session_id || `session_${Date.now()}`;
-      searchContextStore.set(contextId, results);
-
       const contentText = results
         .map(
           (r, i) =>
@@ -160,10 +147,11 @@ server.registerTool(
         structuredContent: {
           results: results,
           total: totalHits,
-          session_id: contextId,
         },
       };
     } catch (error: any) {
+      console.log("Error during search:", error);
+
       return {
         content: [
           {
@@ -178,44 +166,47 @@ server.registerTool(
 );
 
 server.registerTool(
-  "summarize_results",
+  "summarize_and_cite",
   {
-    title: "Summarize Search Results",
+    title: "Summarize and Cite",
     description:
-      "Summarize and synthesize information from previously retrieved documents to answer a user question. Requires a session_id from a previous search_docs call. Generates a coherent answer based on the retrieved content.",
+      "Summarize the provided search results to answer a question and return citation metadata for the sources used.",
     inputSchema: {
-      session_id: z.string().describe("Session ID from the search_docs call"),
+      results: z
+        .array(SearchResultSchema)
+        .describe("Array of search results from search_docs"),
       question: z.string().describe("The question to answer"),
       max_length: z
         .number()
+        .optional()
+        .default(500)
         .describe("Maximum length of the summary in characters"),
+      max_docs: z
+        .number()
+        .optional()
+        .default(5)
+        .describe("Maximum number of documents to include in the context"),
     },
     outputSchema: {
       summary: z.string(),
       sources_used: z.number(),
+      citations: z.array(
+        z.object({
+          id: z.number(),
+          title: z.string(),
+          tags: z.array(z.string()),
+          relevance_score: z.number(),
+        })
+      ),
     },
   },
-  async ({ session_id, question, max_length = 500 }) => {
-    if (!session_id || !question) {
+  async ({ results, question, max_length = 500, max_docs = 5 }) => {
+    if (!results || results.length === 0 || !question) {
       return {
         content: [
           {
             type: "text",
-            text: "Both session_id and question parameters are required",
-          },
-        ],
-        isError: true,
-      };
-    }
-
-    const searchResults = searchContextStore.get(session_id);
-
-    if (!searchResults || searchResults.length === 0) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: "No search results found for this session. Please call search_docs first.",
+            text: "Both results and question parameters are required, and results must not be empty",
           },
         ],
         isError: true,
@@ -223,9 +214,13 @@ server.registerTool(
     }
 
     try {
-      const context = searchResults
-        .slice(0, 5)
-        .map((r, i) => `[Document ${i + 1}: ${r.title}]\n${r.content}`)
+      const used = results.slice(0, max_docs);
+
+      const context = used
+        .map(
+          (r: SearchResult, i: number) =>
+            `[Document ${i + 1}: ${r.title}]\\n${r.content}`
+        )
         .join("\n\n---\n\n");
 
       // Generate summary with OpenAI
@@ -239,27 +234,45 @@ server.registerTool(
           },
           {
             role: "user",
-            content: `Question: ${question}\n\nRelevant Documents:\n${context}`,
+            content: `Question: ${question}\\n\\nRelevant Documents:\\n${context}`,
           },
         ],
         max_tokens: Math.min(Math.ceil(max_length / 4), 1000),
         temperature: 0.3,
       });
 
-      const summary =
-        "AI generated summary: " + completion.choices[0]?.message?.content ||
-        "No summary generated.";
+      const summaryText =
+        completion.choices[0]?.message?.content ?? "No summary generated.";
+
+      const citations = results.map((r: SearchResult) => ({
+        id: r.id,
+        title: r.title,
+        tags: r.tags,
+        relevance_score: r.score,
+      }));
+
+      const citationText = citations
+        .map(
+          (c: any, i: number) =>
+            `[${i + 1}] ID: ${c.id}, Title: "${c.title}", Tags: ${c.tags.join(
+              ", "
+            )}, Score: ${c.relevance_score.toFixed(2)}`
+        )
+        .join("\n");
+
+      const combinedText = `Summary:\\n\\n${summaryText}\\n\\nSources used (${citations.length}):\\n\\n${citationText}`;
 
       return {
         content: [
           {
             type: "text",
-            text: summary,
+            text: combinedText,
           },
         ],
         structuredContent: {
-          summary: summary,
-          sources_used: searchResults.length,
+          summary: summaryText,
+          sources_used: citations.length,
+          citations: citations,
         },
       };
     } catch (error: any) {
@@ -267,90 +280,12 @@ server.registerTool(
         content: [
           {
             type: "text",
-            text: `Error generating summary: ${error.message}`,
+            text: `Error generating summary and citations: ${error.message}`,
           },
         ],
         isError: true,
       };
     }
-  }
-);
-
-// Tool 3: Cite sources
-server.registerTool(
-  "cite_sources",
-  {
-    title: "Cite Sources",
-    description:
-      "Return citation information for documents used in the previous search. Provides document IDs, titles, and tags for proper attribution. Use this after summarize_results to provide references.",
-    inputSchema: {
-      session_id: z.string().describe("Session ID from the search_docs call"),
-    },
-    outputSchema: {
-      citations: z.array(
-        z.object({
-          id: z.number(),
-          title: z.string(),
-          tags: z.array(z.string()),
-          relevance_score: z.number(),
-        })
-      ),
-    },
-  },
-  async ({ session_id }) => {
-    if (!session_id) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: "session_id parameter is required",
-          },
-        ],
-        isError: true,
-      };
-    }
-
-    const searchResults = searchContextStore.get(session_id);
-
-    if (!searchResults || searchResults.length === 0) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: "No search results found for this session. Please call search_docs first.",
-          },
-        ],
-        isError: true,
-      };
-    }
-
-    const citations = searchResults.map((r) => ({
-      id: r.id,
-      title: r.title,
-      tags: r.tags,
-      relevance_score: r.score,
-    }));
-
-    const citationText = citations
-      .map(
-        (c, i) =>
-          `[${i + 1}] ID: ${c.id}, Title: "${c.title}", Tags: ${c.tags.join(
-            ", "
-          )}, Score: ${c.relevance_score.toFixed(2)}`
-      )
-      .join("\n");
-
-    return {
-      content: [
-        {
-          type: "text",
-          text: `Sources used (${citations.length}):\n\n${citationText}`,
-        },
-      ],
-      structuredContent: {
-        citations: citations,
-      },
-    };
   }
 );
 
